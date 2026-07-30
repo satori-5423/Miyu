@@ -225,7 +225,9 @@ function __miyu_accept_line
     set -e __miyu_image_counter
     __miyu_wrap_fish_prompt
     set -g __miyu_cursor_hidden 1
-    history append -- "$buffer"
+    if not string match -qr '^-' -- "$buffer"
+        history append -- "$buffer"
+    end
     set -g __miyu_pending_buffer "$buffer"
     commandline -b -- ""
     printf '\e[?25l'
