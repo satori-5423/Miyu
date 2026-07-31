@@ -1,6 +1,6 @@
 use crate::config::{AppConfig, KnowledgeBasePluginConfig, MemoryConfig};
 use crate::paths::MiyuPaths;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
@@ -343,6 +343,65 @@ impl MemoryStore {
             "query": query,
             "facts": facts.iter().map(memory_hit_json).collect::<Vec<_>>(),
             "episodes": episodes.iter().map(memory_hit_json).collect::<Vec<_>>(),
+        }))
+    }
+
+    /// 列出长期记忆（facts 表），按最近更新排序。
+    pub fn list_memories(&self, limit: usize, include_forgotten: bool) -> Result<Value> {
+        if !self.data_db.is_file() {
+            return Ok(json!({ "ok": true, "facts": [] }));
+        }
+        self.init()?;
+        let facts = self.list_facts(limit, include_forgotten)?;
+        Ok(json!({
+            "ok": true,
+            "facts": facts.iter().map(memory_hit_json).collect::<Vec<_>>(),
+        }))
+    }
+
+    fn list_facts(&self, limit: usize, include_forgotten: bool) -> Result<Vec<MemoryHit>> {
+        let sql = "SELECT id, content, source, status, created_at FROM facts ORDER BY updated_at DESC LIMIT 1000";
+        let conn = self.data_conn()?;
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut hits = Vec::new();
+        for row in rows {
+            let (id, content, source, status, timestamp) = row?;
+            if !include_forgotten && status == "forgotten" {
+                continue;
+            }
+            hits.push(MemoryHit {
+                id,
+                content,
+                score: 0.0,
+                timestamp,
+                source,
+            });
+        }
+        hits.truncate(limit.clamp(1, 500));
+        Ok(hits)
+    }
+
+    /// 按 id 删除一条长期记忆（facts 表）。
+    pub fn delete_memory(&self, id: i64) -> Result<Value> {
+        self.init()?;
+        let conn = self.data_conn()?;
+        let affected = conn.execute("DELETE FROM facts WHERE id = ?1", params![id])?;
+        if affected == 0 {
+            bail!("memory id {id} not found");
+        }
+        Ok(json!({
+            "ok": true,
+            "id": id,
+            "type": "fact",
         }))
     }
 
@@ -805,6 +864,91 @@ mod tests {
         let after = store.recall_memories("你好 XMODIFIERS", 5, false).unwrap();
         assert!(after["facts"].as_array().unwrap().is_empty());
         assert!(after["episodes"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_memories_lists_facts() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = AppConfig::default();
+        let paths = test_paths(&temp);
+        let store = MemoryStore::new(&config, &paths);
+        store
+            .remember_fact("Niri 输入法需要 XMODIFIERS", "test")
+            .unwrap();
+        store.remember_fact("shorin 喜欢单机游戏", "test")
+            .unwrap();
+
+        let result = store.list_memories(20, false).unwrap();
+        let facts = result["facts"].as_array().unwrap();
+        assert_eq!(facts.len(), 2);
+        let contents = facts
+            .iter()
+            .map(|item| item["content"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert!(contents.contains(&"Niri 输入法需要 XMODIFIERS"));
+        assert!(contents.contains(&"shorin 喜欢单机游戏"));
+        assert!(facts[0]["id"].as_i64().is_some());
+    }
+
+    #[test]
+    fn list_memories_respects_limit_and_forgotten_filter() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = AppConfig::default();
+        let paths = test_paths(&temp);
+        let store = MemoryStore::new(&config, &paths);
+        store.remember_fact("第一条记忆", "test").unwrap();
+        store.remember_fact("第二条记忆", "test").unwrap();
+
+        let limited = store.list_memories(1, false).unwrap();
+        assert_eq!(limited["facts"].as_array().unwrap().len(), 1);
+
+        // 将任意一条标记为 forgotten 后，不包含 forgotten 时只剩另一条
+        let id = limited["facts"][0]["id"].as_i64().unwrap();
+        store
+            .data_conn()
+            .unwrap()
+            .execute(
+                "UPDATE facts SET status='forgotten' WHERE id=?1",
+                params![id],
+            )
+            .unwrap();
+        let active_only = store.list_memories(20, false).unwrap();
+        assert_eq!(active_only["facts"].as_array().unwrap().len(), 1);
+        let with_forgotten = store.list_memories(20, true).unwrap();
+        assert_eq!(with_forgotten["facts"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn delete_memory_removes_a_fact_by_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = AppConfig::default();
+        let paths = test_paths(&temp);
+        let store = MemoryStore::new(&config, &paths);
+        let fact_id = store.remember_fact("要删除的知识点", "test").unwrap();
+        store.remember_fact("要保留的知识点", "test").unwrap();
+
+        let result = store.delete_memory(fact_id).unwrap();
+        assert_eq!(result["type"], "fact");
+        assert_eq!(result["id"].as_i64(), Some(fact_id));
+        let remaining = store.list_memories(20, false).unwrap();
+        let contents = remaining["facts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["content"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert!(!contents.contains(&"要删除的知识点"));
+        assert!(contents.contains(&"要保留的知识点"));
+    }
+
+    #[test]
+    fn delete_memory_reports_missing_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = AppConfig::default();
+        let paths = test_paths(&temp);
+        let store = MemoryStore::new(&config, &paths);
+        let error = store.delete_memory(999).unwrap_err().to_string();
+        assert!(error.contains("not found"));
     }
 
     #[test]

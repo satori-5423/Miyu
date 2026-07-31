@@ -671,9 +671,11 @@ fn localize_kb_command(mut command: clap::Command) -> clap::Command {
 fn localize_memory_command(mut command: clap::Command) -> clap::Command {
     let descriptions = [
         ("stats", "Show memory statistics", "显示记忆统计"),
+        ("list", "List memories", "列出记忆"),
         ("reset", "Clear assistant memory", "清空助手记忆"),
         ("search", "Search memories", "搜索记忆"),
         ("remember", "Save a manual fact", "手动保存事实"),
+        ("delete", "Delete a memory by id", "按 id 删除记忆"),
     ];
     for (name, en, zh) in descriptions {
         command = command.mut_subcommand(name, |subcommand| subcommand.about(t(en, zh)));
@@ -687,6 +689,13 @@ fn localize_memory_command(mut command: clap::Command) -> clap::Command {
                 ))
             })
         })
+        .mut_subcommand("list", |subcommand| {
+            subcommand
+                .mut_arg("limit", |arg| arg.help(t("Maximum results", "最大结果数")))
+                .mut_arg("forgotten", |arg| {
+                    arg.help(t("Include forgotten memories", "包含已遗忘记忆"))
+                })
+        })
         .mut_subcommand("search", |subcommand| {
             subcommand
                 .mut_arg("query", |arg| arg.help(t("Search query", "搜索查询")))
@@ -699,6 +708,9 @@ fn localize_memory_command(mut command: clap::Command) -> clap::Command {
             subcommand
                 .mut_arg("content", |arg| arg.help(t("Fact content", "事实内容")))
                 .mut_arg("source", |arg| arg.help(t("Source label", "来源标签")))
+        })
+        .mut_subcommand("delete", |subcommand| {
+            subcommand.mut_arg("id", |arg| arg.help(t("Memory id", "记忆 id")))
         })
 }
 
@@ -862,9 +874,24 @@ pub struct MemoryArgs {
 #[derive(Debug, Subcommand)]
 pub enum MemoryCommand {
     Stats,
+    List(MemoryListArgs),
     Reset(MemoryResetArgs),
     Search(MemorySearchArgs),
     Remember(MemoryRememberArgs),
+    Delete(MemoryDeleteArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct MemoryListArgs {
+    #[arg(short, long, default_value_t = 20)]
+    pub limit: usize,
+    #[arg(long)]
+    pub forgotten: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct MemoryDeleteArgs {
+    pub id: i64,
 }
 
 #[derive(Debug, Args)]
@@ -7915,6 +7942,9 @@ fn run_memory(paths: &MiyuPaths, args: MemoryArgs) -> Result<()> {
     let store = MemoryStore::new(&config, paths);
     match args.command {
         MemoryCommand::Stats => println!("{}", store.stats()?),
+        MemoryCommand::List(args) => {
+            print_memory_list(&store, args.limit, args.forgotten)?;
+        }
         MemoryCommand::Reset(args) => {
             store.reset_all(args.include_skills)?;
             println!("{}", t("cleared assistant memory", "已清空助手记忆"));
@@ -7929,8 +7959,48 @@ fn run_memory(paths: &MiyuPaths, args: MemoryArgs) -> Result<()> {
             let id = store.remember_fact(&content, &args.source)?;
             println!("{}: {id}", t("remembered fact", "已记住事实"));
         }
+        MemoryCommand::Delete(args) => {
+            println!("{}", store.delete_memory(args.id)?);
+        }
     }
     Ok(())
+}
+
+fn print_memory_list(store: &MemoryStore, limit: usize, include_forgotten: bool) -> Result<()> {
+    let result = store.list_memories(limit, include_forgotten)?;
+    let facts = result["facts"].as_array().cloned().unwrap_or_default();
+    if facts.is_empty() {
+        println!("{}", t("no memories yet", "暂无长期记忆"));
+        return Ok(());
+    }
+    for item in &facts {
+        println!("{}", memory_list_line(item));
+    }
+    Ok(())
+}
+
+fn memory_list_line(item: &serde_json::Value) -> String {
+    let id = item["id"].as_i64().unwrap_or_default();
+    let content = item["content"].as_str().unwrap_or_default();
+    let source = item["source"].as_str().unwrap_or_default();
+    let timestamp = item["timestamp"].as_str().unwrap_or_default();
+    let source_part = if source.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", source)
+    };
+    let time_part = if timestamp.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", memory_list_time(timestamp))
+    };
+    format!("[{id}] {content}{source_part}{time_part}")
+}
+
+fn memory_list_time(timestamp: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|time| time.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|_| timestamp.to_string())
 }
 
 fn run_skills(paths: &MiyuPaths, args: SkillsArgs) -> Result<()> {
