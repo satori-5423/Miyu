@@ -375,6 +375,51 @@ impl KnowledgeBase {
         self.read_file_existing(name, start_line, max_lines, false)
     }
 
+    /// Resolve a caller-supplied path to a stored record name, tolerating
+    /// omitted directory prefixes (e.g. `4. xx/文件.md` for
+    /// `default-kb/kb/4. xx/文件.md`): exact match first, then a unique
+    /// suffix match; otherwise fail with concrete candidates so the model
+    /// can self-correct in one step.
+    fn resolve_stored_name(&self, rel: &str) -> Result<String> {
+        let records = self.list_existing()?;
+        if records.iter().any(|record| record.name == rel) {
+            return Ok(rel.to_string());
+        }
+        let suffix = format!("/{rel}");
+        let matches = records
+            .iter()
+            .filter(|record| record.name.ends_with(&suffix))
+            .map(|record| record.name.clone())
+            .collect::<Vec<_>>();
+        match matches.len() {
+            1 => Ok(matches.into_iter().next().unwrap()),
+            0 => {
+                let mut scored = records
+                    .iter()
+                    .map(|record| (score_file_name(rel, &record.name).0, &record.name))
+                    .filter(|(score, _)| *score > 0.0)
+                    .collect::<Vec<_>>();
+                scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                let hints = scored
+                    .iter()
+                    .take(3)
+                    .map(|(_, name)| name.as_str())
+                    .collect::<Vec<_>>();
+                if hints.is_empty() {
+                    bail!("knowledge base file not found: {rel}")
+                }
+                bail!(
+                    "knowledge base file not found: {rel}；相近的文件: {}",
+                    hints.join("、")
+                )
+            }
+            _ => bail!(
+                "path {rel} matches multiple knowledge base files: {}；请用完整路径",
+                matches.join("、")
+            ),
+        }
+    }
+
     fn read_file_existing(
         &self,
         name: &str,
@@ -382,12 +427,22 @@ impl KnowledgeBase {
         max_lines: Option<usize>,
         create_parent: bool,
     ) -> Result<String> {
-        let rel = normalize_relative_path(name)?;
-        let path = if create_parent {
-            self.safe_file_path(&rel)?
-        } else {
-            self.existing_file_path(&rel)?
+        let mut rel = normalize_relative_path(name)?;
+        let build_path = |rel: &str| -> Result<PathBuf> {
+            if create_parent {
+                self.safe_file_path(rel)
+            } else {
+                // Fails with ENOENT when the parent directory itself is
+                // missing — treat that the same as "file not found" so the
+                // prefix-tolerant resolution below still gets its chance.
+                self.existing_file_path(rel)
+            }
         };
+        let mut path = build_path(&rel).unwrap_or_default();
+        if !path.exists() {
+            rel = self.resolve_stored_name(&rel)?;
+            path = build_path(&rel)?;
+        }
         if !path.exists() {
             bail!("knowledge base file not found: {rel}")
         }
@@ -701,7 +756,7 @@ impl KnowledgeBase {
                 continue;
             };
             let score = cosine(&query_embedding, &embedding);
-            if score < self.config.plugins.knowledge_base.semantic_min_score {
+            if score < self.config.embedding.min_score {
                 continue;
             }
             results.push(SearchResult::new(
@@ -826,16 +881,17 @@ impl KnowledgeBase {
     }
 
     fn embedding_provider(&self) -> Result<Option<(ProviderConfig, String)>> {
-        let kb = &self.config.plugins.knowledge_base;
-        if kb.embedding_provider_id.trim().is_empty() || kb.embedding_model.trim().is_empty() {
+        let embedding = &self.config.embedding;
+        if !embedding.is_configured() {
             return Ok(None);
         }
         let mut provider = self
             .config
-            .provider(Some(kb.embedding_provider_id.trim()))?
+            .provider(Some(embedding.provider_id.trim()))?
             .clone();
-        provider.default_model = kb.embedding_model.trim().to_string();
-        Ok(Some((provider, kb.embedding_model.trim().to_string())))
+        let model = embedding.model.trim().to_string();
+        provider.default_model = model.clone();
+        Ok(Some((provider, model)))
     }
 
     fn meta_conn(&self) -> Result<Connection> {
@@ -1130,9 +1186,7 @@ pub async fn embed_text(
         bail!("embedding provider {} has no api_key", provider.id)
     }
     let client = Client::builder()
-        .timeout(Duration::from_secs(
-            config.plugins.knowledge_base.embedding_timeout_seconds,
-        ))
+        .timeout(Duration::from_secs(config.embedding.timeout_seconds.max(1)))
         .build()?;
     let url = format!("{}/embeddings", provider.base_url.trim_end_matches('/'));
     let response = client
@@ -1534,6 +1588,7 @@ mod tests {
 
     fn test_paths(root: &Path) -> MiyuPaths {
         MiyuPaths {
+            root_dir: root.to_path_buf(),
             config_dir: root.join("config"),
             config_file: root.join("config/config.jsonc"),
             skills_dir: root.join("config/skills"),
