@@ -4593,7 +4593,22 @@ fn run_shell_classify(shell_name: &str, message: &str) -> Result<()> {
     if shell::is_shell_command(message, shell_name) {
         std::process::exit(0);
     }
-    std::process::exit(1);
+    // 以 `-` 开头的内容视为对话，交给 AI；其他内容（如多行命令）
+    // 交还 shell 正常执行报错，避免误触发对话。
+    if first_line_starts_with_dash(message) {
+        std::process::exit(1);
+    }
+    std::process::exit(2);
+}
+
+/// 判断内容的第一行（去除前导空白后）是否以 `-` 开头。
+/// 以 `-` 开头是 shell 集成的对话触发约定。
+fn first_line_starts_with_dash(input: &str) -> bool {
+    input
+        .lines()
+        .next()
+        .map(|line| line.trim_start().starts_with('-'))
+        .unwrap_or(false)
 }
 
 async fn run_shell_intercept(paths: &MiyuPaths, shell_name: &str, message: String) -> Result<()> {
@@ -4601,6 +4616,14 @@ async fn run_shell_intercept(paths: &MiyuPaths, shell_name: &str, message: Strin
         bail!("{}: {shell_name}", t("unsupported shell", "不支持的 shell"));
     }
     if message.trim().is_empty() {
+        bail!(
+            "{}",
+            t("not a natural language command", "不是自然语言命令")
+        );
+    }
+    // 只拦截以 `-` 开头的命令视为对话；其他内容（如多行命令、普通命令名
+    // 拼写错误）交还 shell 正常报错，不打扰 AI。
+    if !first_line_starts_with_dash(&message) {
         bail!(
             "{}",
             t("not a natural language command", "不是自然语言命令")
@@ -13364,6 +13387,22 @@ mod repl_input_tests {
 
         assert_eq!(layout.cursor, (4, 3));
         assert_eq!(layout.occupied_bottom, Some(3));
+    }
+
+    #[test]
+    fn first_line_dash_detection() {
+        // 以 `-` 开头视为对话
+        assert!(first_line_starts_with_dash("- 帮我看看这个报错"));
+        assert!(first_line_starts_with_dash("  -H Content-Type: application/json \\"));
+        assert!(first_line_starts_with_dash("-q 查询"));
+        // 多行时只看第一行开头
+        assert!(first_line_starts_with_dash("- 对话第一行\ncurl https://x \\\n  -H 'a'"));
+        assert!(!first_line_starts_with_dash("curl https://x \\\n  -H 'a'"));
+        assert!(!first_line_starts_with_dash("curl https://x"));
+        assert!(!first_line_starts_with_dash("帮我查一下 niri"));
+        assert!(!first_line_starts_with_dash("this-command-does-not-exist --foo"));
+        assert!(!first_line_starts_with_dash(""));
+        assert!(!first_line_starts_with_dash("   "));
     }
 
     #[test]
