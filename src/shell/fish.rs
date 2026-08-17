@@ -210,7 +210,7 @@ function __miyu_accept_line
         return
     end
 
-    if not __miyu_buffer_is_multiline "$buffer"
+    if not __miyu_buffer_is_multiline "$buffer"; and not string match -qr '^-' -- "$trimmed"
         __miyu_execute_or_continue
         return
     end
@@ -373,6 +373,11 @@ mod tests {
         assert!(hook.contains("__miyu_execute_or_continue"));
         assert!(hook.contains("__miyu_buffer_is_multiline"));
         assert!(hook.contains("test (string split \\n -- \"$argv[1]\" | count) -gt 1"));
+        // 单行以 `-` 开头也走对话路径，避免被 fish 记录进历史
+        assert!(hook.contains(
+            "if not __miyu_buffer_is_multiline \"$buffer\"; and not string match -qr '^-' -- \"$trimmed\""
+        ));
+        assert!(hook.contains("if not string match -qr '^-' -- \"$buffer\""));
         assert!(hook.contains("__miyu_first_command"));
         assert!(hook.contains("commandline --input=\"$argv[1]\" --tokens-expanded"));
         assert!(hook.contains("type -q -- \"$first_command\""));
